@@ -175,14 +175,14 @@ runEditor lamduDir mFontPath = do
 
 
 mainLoopDebugMode ::
-  GLFW.Window ->
+  GLFW.Window -> Draw.Font ->
   IO (Version, Config) ->
   ( Config -> Widget.Size ->
     ( IO (Widget IO)
     , Widget IO -> IO (Widget IO)
     )
   ) -> IO a
-mainLoopDebugMode win getConfig iteration = do
+mainLoopDebugMode win font getConfig iteration = do
   debugModeRef <- newIORef False
   lastVersionNumRef <- newIORef 0
   let
@@ -206,7 +206,7 @@ mainLoopDebugMode win getConfig iteration = do
       (curVersionNum, _) <- getConfig
       atomicModifyIORef lastVersionNumRef $ \lastVersionNum ->
         (curVersionNum, lastVersionNum /= curVersionNum)
-  mainLoopWidget win tickHandler makeDebugModeWidget getAnimHalfLife
+  mainLoopWidget win tickHandler font makeDebugModeWidget getAnimHalfLife
 
 cacheMakeWidget :: Eq a => (a -> IO (Widget IO)) -> IO (a -> IO (Widget IO))
 cacheMakeWidget mkWidget = do
@@ -300,7 +300,7 @@ runDb win getConfig font db = do
         (size / sizeFactor, cursor)
       return . Widget.scale sizeFactor $ Widget.weakerEvents eventMap widget
   makeWidgetCached <- cacheMakeWidget makeWidget
-  mainLoopDebugMode win getConfig $ \config size ->
+  mainLoopDebugMode win font getConfig $ \config size ->
     ( wrapFlyNav =<< makeWidgetCached (config, size)
     , addHelpWithStyle (helpConfig font (Config.help config)) size
     )
