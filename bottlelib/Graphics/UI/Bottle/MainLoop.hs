@@ -1,18 +1,20 @@
-{-# LANGUAGE CPP #-}
+{-# LANGUAGE TemplateHaskell, CPP #-}
 module Graphics.UI.Bottle.MainLoop
   ( mainLoopAnim
   , mainLoopImage
   , mainLoopWidget
   ) where
 
-import           Control.Applicative ((<$>))
+import           Control.Applicative ((<$>), (<*>))
 import           Control.Concurrent (threadDelay)
 import           Control.Concurrent.MVar
 import qualified Control.Lens as Lens
 import           Control.Lens.Operators
 import           Control.Lens.Tuple
 import           Control.Monad (when, unless)
+import qualified Data.ByteString.Char8 as SBS8
 import           Data.IORef
+import           Data.List (genericLength)
 import           Data.MRUMemo (memoIO)
 import           Data.Monoid (Monoid(..), (<>))
 import qualified Data.Monoid as Monoid
@@ -20,7 +22,6 @@ import           Data.Time.Clock (NominalDiffTime)
 import           Data.Time.Clock (getCurrentTime, diffUTCTime)
 import           Data.Traversable (traverse, sequenceA)
 import           Data.Vector.Vector2 (Vector2(..))
-import qualified Data.Vector.Vector2 as Vector2
 import           Graphics.DrawingCombinators ((%%))
 import qualified Graphics.DrawingCombinators as Draw
 import           Graphics.DrawingCombinators.Utils (Image)
@@ -32,10 +33,14 @@ import qualified Graphics.UI.Bottle.Animation as Anim
 import qualified Graphics.UI.Bottle.EventMap as E
 import           Graphics.UI.Bottle.SizedFont (SizedFont(..))
 import qualified Graphics.UI.Bottle.SizedFont as SizedFont
+import           Graphics.UI.Bottle.View (View(..))
+import qualified Graphics.UI.Bottle.View as View
 import           Graphics.UI.Bottle.Widget (Widget)
 import qualified Graphics.UI.Bottle.Widget as Widget
+import qualified Graphics.UI.Bottle.Widgets.GridView as GridView
 import qualified Graphics.UI.GLFW as GLFW
 import           Graphics.UI.GLFW.Events (KeyEvent, Event(..), eventLoop)
+import           Text.Printf.Mauke.TH
 
 timeBetweenInvocations :: IO ((Maybe NominalDiffTime -> IO a) -> IO a)
 timeBetweenInvocations = do
@@ -50,12 +55,36 @@ timeBetweenInvocations = do
       result <- f mTimeSince
       return (Just currentTime, result)
 
+mkStatser :: (Ord a, Fractional a) => Int -> IO (a -> IO (a, a, a))
+mkStatser n = do
+  fifo <- newIORef []
+  return $ \added -> do
+    modifyIORef fifo (take n . (added:))
+    samples <- readIORef fifo
+    return (minimum samples, avg samples, maximum samples)
+  where
+    avg = (/) <$> sum <*> genericLength
+
+placeAt :: Widget.Size -> Vector2 Widget.R -> View -> View
+placeAt winSize ratio view =
+  view
+  & View.animFrame %~ Anim.translate (ratio * (winSize - view ^. View.size))
+
+renderText :: SizedFont -> Int -> String -> View
+renderText fpsFont i text =
+  View size (Anim.sizedFrame [SBS8.pack (show i)] size image)
+  where
+    image = SizedFont.render fpsFont text
+    size = SizedFont.textSize fpsFont text
+
 mainLoopImage ::
   GLFW.Window -> Draw.Font -> (Widget.Size -> KeyEvent -> IO Bool) ->
   (Bool -> Widget.Size -> IO (Maybe Image)) -> IO a
-mainLoopImage win font eventHandler makeImage = do
-  addDelayArg <- timeBetweenInvocations
-  eventLoop win $ handleEvents addDelayArg
+mainLoopImage win font eventHandler makeImage =
+  do
+    statser <- mkStatser 20
+    addDelayArg <- timeBetweenInvocations
+    eventLoop win $ handleEvents statser addDelayArg
   where
     windowSize = do
       (x, y) <- GLFW.getFramebufferSize win
@@ -68,22 +97,25 @@ mainLoopImage win font eventHandler makeImage = do
     handleEvent _ EventWindowRefresh = return True
 
     fpsFont = SizedFont font 20
-    renderText str =
-      (SizedFont.render fpsFont str, SizedFont.textSize fpsFont str)
-    placeAt winSize ratio (image, size) =
-      Draw.translate
-      (Vector2.uncurry (,) (ratio * (winSize - size))) %% image
-    addDelayToImage winSize mkMImage mTimeSince =
+    addDelayToImage statser winSize mkMImage mTimeSince = do
+      mImage <- mkMImage
       let
-        str = maybe "N/A" (show . (1/)) mTimeSince
-      in
-        mkMImage
-        <&> Lens._Just <>~
-            ( renderText str
-              & placeAt winSize (Vector2 1 0)
-            )
+        right = Vector2 1 0
+        mkFpsImage (lo, avg, hi) =
+          [lo, avg, hi]
+          <&> $(printf "%02.02f")
+          & zipWith (renderText fpsFont) [0..]
+          <&> (: [])
+          & GridView.makeAlign right
+          & placeAt winSize (Vector2 1 0)
+      fpsImage <-
+        mTimeSince
+        & maybe (return View.empty) (fmap mkFpsImage . statser . (1/))
+      mImage
+        <&> mappend (Anim.draw (fpsImage ^. View.animFrame))
+        & return
 
-    handleEvents addDelayArg events = do
+    handleEvents statser addDelayArg events = do
       winSize@(Vector2 winSizeX winSizeY) <- windowSize
       anyChange <- or <$> traverse (handleEvent winSize) events
       -- TODO: Don't do this *EVERY* frame but on frame-buffer size update events?
@@ -92,7 +124,7 @@ mainLoopImage win font eventHandler makeImage = do
          GL.Size (round winSizeX) (round winSizeY))
       mNewImage <-
         makeImage anyChange winSize
-        & addDelayToImage winSize
+        & addDelayToImage statser winSize
         & addDelayArg
       case mNewImage of
         Nothing ->
