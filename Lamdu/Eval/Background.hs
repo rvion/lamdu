@@ -17,7 +17,6 @@ import           Control.Lens (Lens')
 import qualified Control.Lens as Lens
 import           Control.Lens.Operators
 import           Control.Lens.Tuple
-import           Control.Monad.Trans.Either (runEitherT)
 import           Control.Monad.Trans.State.Strict (evalStateT)
 import qualified Data.ByteString.Char8 as BS8
 import           Data.IORef
@@ -29,14 +28,14 @@ import qualified Data.Set as Set
 import qualified Lamdu.Data.Definition as Def
 import qualified Lamdu.Eval as Eval
 import           Lamdu.Eval.Results (EvalResults(..))
-import           Lamdu.Eval.Val (Val, ScopeId)
+import           Lamdu.Eval.Val (Val, EvalResult, ScopeId)
 import qualified Lamdu.Eval.Val as EvalVal
 import qualified Lamdu.Expr.Val as V
 import           System.IO (stderr)
 
 data Actions pl = Actions
     { _aLoadGlobal :: V.GlobalId -> IO (Maybe (Def.Body (V.Val pl)))
-    , _aRunBuiltin :: Def.FFIName -> Val pl -> Val pl
+    , _aRunBuiltin :: Def.FFIName -> Val pl -> EvalResult pl
     , _aReportUpdatesAvailable :: IO ()
     }
 
@@ -57,19 +56,19 @@ data Status
 
 data State pl = State
     { _sStatus :: !Status
-    , _sAppliesOfLam :: !(Map pl (Map ScopeId [(ScopeId, Val pl)]))
+    , _sAppliesOfLam :: !(Map pl (Map ScopeId [(ScopeId, EvalResult pl)]))
       -- Maps of already-evaluated pl's/thunks
-    , _sValMap :: !(Map pl (Map ScopeId (Val pl)))
+    , _sValMap :: !(Map pl (Map ScopeId (EvalResult pl)))
     , _sDependencies :: !(Set pl, Set V.GlobalId)
     }
 
-sAppliesOfLam :: Lens' (State pl) (Map pl (Map ScopeId [(ScopeId, Val pl)]))
+sAppliesOfLam :: Lens' (State pl) (Map pl (Map ScopeId [(ScopeId, EvalResult pl)]))
 sAppliesOfLam f State{..} = f _sAppliesOfLam <&> \_sAppliesOfLam -> State{..}
 
 sStatus :: Lens' (State pl) Status
 sStatus f State{..} = f _sStatus <&> \_sStatus -> State{..}
 
-sValMap :: Lens' (State pl) (Map pl (Map ScopeId (Val pl)))
+sValMap :: Lens' (State pl) (Map pl (Map ScopeId (EvalResult pl)))
 sValMap f State{..} = f _sValMap <&> \_sValMap -> State{..}
 
 sDependencies :: Lens' (State pl) (Set pl, Set V.GlobalId)
@@ -129,7 +128,6 @@ evalThread actions stateRef src =
         result <-
             Eval.evalScopedVal (Eval.ScopedVal EvalVal.emptyScope src)
             & Eval.runEvalT
-            & runEitherT
             & (`evalStateT` Eval.initialState env)
         case result of
             Left e -> handleError e Error
@@ -146,10 +144,10 @@ evalThread actions stateRef src =
 results :: State pl -> EvalResults pl
 results state =
     EvalResults
-    { erExprValues = state ^. sValMap <&> Lens.mapped . Lens.mapped .~ ()
+    { erExprValues = state ^. sValMap <&> Lens.mapped . Lens._Right . Lens.mapped .~ ()
     , erAppliesOfLam =
         state ^. sAppliesOfLam
-        <&> Lens.mapped . Lens.mapped . Lens._2 . Lens.mapped .~ ()
+        <&> Lens.mapped . Lens.mapped . Lens._2 . Lens._Right . Lens.mapped .~ ()
     }
 
 getState :: Evaluator pl -> IO (State pl)

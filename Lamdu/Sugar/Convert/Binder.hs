@@ -65,7 +65,7 @@ cpParams f ConventionalParams {..} = f _cpParams <&> \_cpParams -> ConventionalP
 data FieldParam = FieldParam
     { fpTag :: T.Tag
     , fpFieldType :: Type
-    , fpValue :: Map ScopeId [(ScopeId, EV.Val ())]
+    , fpValue :: Map ScopeId [(ScopeId, EV.EvalResult ())]
     }
 
 onMatchingSubexprs ::
@@ -475,16 +475,12 @@ isParamAlwaysUsedWithGetField (V.Lam param body) =
         cond (Val () (V.BLeaf (V.LVar v)) : _) _ = v == param
         cond _ _ = False
 
-extractField :: T.Tag -> EV.Val pl -> EV.Val pl
+-- TODO: move to eval vals
+extractField :: T.Tag -> EV.Val pl -> EV.EvalResult pl
 extractField tag (EV.HRecExtend (V.RecExtend vt vv vr))
-        | vt == tag = vv
-        | otherwise = extractField tag vr
-extractField _ EV.HError = EV.HError
-extractField tag x =
-        unwords
-        [ "extractField expected record containing tag"
-        , show tag, "but got", show (void x)
-        ] & error
+    | vt == tag = vv
+    | otherwise = vr >>= extractField tag
+extractField _ _ = Left EV.EvalError
 
 isParamUnused :: V.Lam (Val a) -> Bool
 isParamUnused (V.Lam var body) =
@@ -520,7 +516,7 @@ convertLamParams mRecursiveVar lambda lambdaPl =
             , fpFieldType = typeExpr
             , fpValue =
                     lambdaPl ^. Input.evalAppliesOfLam
-                    <&> Lens.mapped . Lens._2 %~ extractField tag
+                    <&> Lens.mapped . Lens._2 %~ (>>= extractField tag)
             }
 
 convertEmptyParams :: MonadA m =>

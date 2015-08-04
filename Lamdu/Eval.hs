@@ -1,7 +1,7 @@
 {-# LANGUAGE NoImplicitPrelude, DeriveFunctor, DeriveFoldable, DeriveTraversable, GeneralizedNewtypeDeriving, OverloadedStrings, TemplateHaskell #-}
 
 module Lamdu.Eval
-    ( EvalT(..), evalError
+    ( EvalT(..)
     , EvalState, initialState
     , ask
     , EvalActions(..)
@@ -16,14 +16,14 @@ import           Prelude.Compat
 import           Control.Lens (at, use)
 import qualified Control.Lens as Lens
 import           Control.Lens.Operators
-import           Control.Monad (void)
 import           Control.Monad.Trans.Class (MonadTrans(..))
-import           Control.Monad.Trans.Either (EitherT(..), left)
+import           Control.Monad.Trans.Either (EitherT(..), left, hoistEither)
 import           Control.Monad.Trans.State.Strict (StateT(..))
+import           Control.MonadA (MonadA)
 import           Data.Map (Map)
 import qualified Data.Map.Strict as Map
 import qualified Lamdu.Data.Definition as Def
-import           Lamdu.Eval.Val (Val(..), Closure(..), Scope(..), emptyScope, ScopeId(..), scopeIdInt)
+import           Lamdu.Eval.Val (Val(..), EvalResult, EvalError(..), Closure(..), Scope(..), emptyScope, ScopeId(..), scopeIdInt)
 import qualified Lamdu.Expr.Val as V
 
 data ScopedVal pl = ScopedVal
@@ -35,13 +35,13 @@ data EventLambdaApplied pl = EventLambdaApplied
     { elaLam :: pl
     , elaParentId :: !ScopeId
     , elaId :: !ScopeId
-    , elaArgument :: !(Val pl)
+    , elaArgument :: !(EvalResult pl)
     } deriving (Show, Functor, Foldable, Traversable)
 
 data EventResultComputed pl = EventResultComputed
     { ercSource :: pl
     , ercScope :: !ScopeId
-    , ercResult :: !(Val pl)
+    , ercResult :: !(EvalResult pl)
     } deriving (Show, Functor, Foldable, Traversable)
 
 data Event pl
@@ -51,7 +51,7 @@ data Event pl
 
 data EvalActions m pl = EvalActions
     { _aReportEvent :: Event pl -> m ()
-    , _aRunBuiltin :: Def.FFIName -> Val pl -> Val pl
+    , _aRunBuiltin :: Def.FFIName -> Val pl -> EvalResult pl
     , _aLoadGlobal :: V.GlobalId -> m (Maybe (Def.Body (V.Val pl)))
     }
 
@@ -66,11 +66,11 @@ data EvalState m pl = EvalState
     }
 
 newtype EvalT pl m a = EvalT
-    { runEvalT :: EitherT String (StateT (EvalState m pl) m) a
+    { runEvalT :: StateT (EvalState m pl) m a
     } deriving (Functor, Applicative, Monad)
 
 liftState :: Monad m => StateT (EvalState m pl) m a -> EvalT pl m a
-liftState = EvalT . lift
+liftState = EvalT
 
 instance MonadTrans (EvalT pl) where
     lift = liftState . lift
@@ -83,13 +83,13 @@ Lens.makeLenses ''EvalState
 ask :: Monad m => EvalT pl m (Env m pl)
 ask = use esReader & liftState
 
-report :: Monad m => Event pl -> EvalT pl m ()
+report :: MonadA m => Event pl -> EvalT pl m ()
 report event =
     do
         rep <- ask <&> (^. eEvalActions . aReportEvent)
         rep event & lift
 
-bindVar :: Monad m => pl -> V.Var -> Val pl -> Scope pl -> EvalT pl m (Scope pl)
+bindVar :: MonadA m => pl -> V.Var -> Val pl -> Scope pl -> EvalT pl m (Scope pl)
 bindVar lamPl var val (Scope parentMap parentId) =
     do
         newScopeId <- liftState $ use esScopeCounter
@@ -98,64 +98,60 @@ bindVar lamPl var val (Scope parentMap parentId) =
             { elaLam = lamPl
             , elaParentId = parentId
             , elaId = newScopeId
-            , elaArgument = val
+            , elaArgument = Right val
             } & ELambdaApplied & report
         Scope
             { _scopeId = newScopeId
             , _scopeMap = parentMap & at var .~ Just val
             } & return
 
-evalError :: Monad m => String -> EvalT pl m a
-evalError = EvalT . left
-
-evalApply :: Monad m => V.Apply (Val pl) -> EvalT pl m (Val pl)
+evalApply ::
+    MonadA m => V.Apply (Val pl) -> EitherT EvalError (EvalT pl m) (Val pl)
 evalApply (V.Apply func arg) =
     case func of
     HFunc (Closure outerScope (V.Lam var body) lamPl) ->
-        bindVar lamPl var arg outerScope
-        >>= evalScopedVal . (`ScopedVal` body)
-    HBuiltin ffiname
-        | containsError arg -> return HError
-        | otherwise ->
-            do
-                runBuiltin <- ask <&> (^. eEvalActions . aRunBuiltin)
-                runBuiltin ffiname arg & return
-        where
-            -- only supports records because that's what builtins handle..
-            containsError HError = True
-            containsError (HRecExtend (V.RecExtend _ v r)) =
-                containsError v || containsError r
-            containsError _ = False
+        bindVar lamPl var arg outerScope & lift
+        >>= EitherT . evalScopedVal . (`ScopedVal` body)
+    HBuiltin ffiname ->
+        do
+            runBuiltin <- lift ask <&> (^. eEvalActions . aRunBuiltin)
+            runBuiltin ffiname arg & hoistEither
     HCase (V.Case caseTag handlerFunc rest) ->
         case arg of
-        HInject (V.Inject sumTag injected)
-            | caseTag == sumTag -> V.Apply handlerFunc injected & evalApply
-            | otherwise -> V.Apply rest arg & evalApply
-        _ -> evalError "Case applied on non sum-type"
-    HError -> return HError
-    _ -> evalError "Apply on non function: "
+        HInject (V.Inject sumTag injected) ->
+            ( if caseTag == sumTag
+                then V.Apply <$> handlerFunc <*> injected
+                else V.Apply <$> rest <*> pure arg
+            ) & hoistEither >>= evalApply
+        _ -> left EvalError
+    _ -> left EvalError
 
-evalScopedVal :: Monad m => ScopedVal pl -> EvalT pl m (Val pl)
+evalScopedVal :: MonadA m => ScopedVal pl -> EvalT pl m (EvalResult pl)
 evalScopedVal (ScopedVal scope expr) =
     reportResultComputed =<<
     case expr ^. V.body of
-    V.BAbs lam -> return $ HFunc $ Closure scope lam (expr ^. V.payload)
-    V.BApp apply -> traverse inner apply >>= evalApply
-    V.BGetField getField -> traverse inner getField >>= evalGetField
-    V.BInject    inject    -> traverse inner inject    <&> HInject
-    V.BRecExtend recExtend -> traverse inner recExtend <&> HRecExtend
-    V.BCase      case_     -> traverse inner case_     <&> HCase
+    V.BAbs lam ->
+        Closure scope lam (expr ^. V.payload) & HFunc & Right & return
+    V.BApp apply ->
+        traverse inner apply <&> sequenceA
+        & EitherT >>= evalApply & runEitherT
+    V.BGetField getField ->
+        getField & traverse inner <&> sequenceA
+        & EitherT >>= evalGetField & runEitherT
+    V.BInject    inject    -> traverse inner inject    <&> Right . HInject
+    V.BRecExtend recExtend -> traverse inner recExtend <&> Right . HRecExtend
+    V.BCase      case_     -> traverse inner case_     <&> Right . HCase
+    V.BFromNom (V.Nom _ v) -> inner v
+    V.BToNom   (V.Nom _ v) -> inner v
     V.BLeaf (V.LGlobal global) -> loadGlobal global
     V.BLeaf (V.LVar var) ->
         case scope ^. scopeMap . at var of
-        Nothing -> evalError $ "Variable out of scope: " ++ show var
-        Just val -> return val
-    V.BLeaf V.LRecEmpty -> return HRecEmpty
-    V.BLeaf V.LAbsurd   -> return HAbsurd
-    V.BLeaf (V.LLiteralInteger i) -> HInteger i & return
-    V.BLeaf V.LHole -> return HError
-    V.BFromNom (V.Nom _ v) -> inner v
-    V.BToNom   (V.Nom _ v) -> inner v
+        Nothing -> Left EvalError & return
+        Just val -> Right val & return
+    V.BLeaf V.LRecEmpty -> Right HRecEmpty & return
+    V.BLeaf V.LAbsurd   -> Right HAbsurd & return
+    V.BLeaf (V.LLiteralInteger i) -> HInteger i & Right & return
+    V.BLeaf V.LHole -> Left EvalError & return
     where
         inner = evalScopedVal . ScopedVal scope
         reportResultComputed result =
@@ -164,30 +160,34 @@ evalScopedVal (ScopedVal scope expr) =
                     & EResultComputed & report
                 return result
 
-evalGetField :: Monad m => V.GetField (Val pl) -> EvalT pl m (Val pl)
+evalGetField ::
+    Monad m => V.GetField (Val pl) -> EitherT EvalError (EvalT pl m) (Val pl)
 evalGetField (V.GetField (HRecExtend (V.RecExtend tag val rest)) searchTag)
-    | searchTag == tag = return val
-    | otherwise = V.GetField rest searchTag & evalGetField
-evalGetField (V.GetField val _) =
-    evalError $ "GetField of value without the field " ++ show (void val)
+    | searchTag == tag = return val & EitherT
+    | otherwise =
+        V.GetField rest searchTag & sequenceA & hoistEither >>= evalGetField
+evalGetField _ = left EvalError
 
-loadGlobal :: Monad m => V.GlobalId -> EvalT pl m (Val pl)
+loadGlobal :: MonadA m => V.GlobalId -> EvalT pl m (EvalResult pl)
 loadGlobal g =
     do
         loaded <- liftState $ use (esLoadedGlobals . at g)
         case loaded of
-            Just cached -> return cached
+            Just cached -> Right cached & return
             Nothing -> do
                 loader <- ask <&> (^. eEvalActions . aLoadGlobal)
                 mLoadedGlobal <- lift $ loader g
                 result <-
                     case mLoadedGlobal of
-                    Nothing -> evalError $ "Global not found " ++ show g
+                    Nothing -> Left EvalError & return
                     Just (Def.BodyBuiltin (Def.Builtin name _t)) ->
-                        return $ HBuiltin name
+                        HBuiltin name & Right & return
                     Just (Def.BodyExpr (Def.Expr expr _t)) ->
                         evalScopedVal $ ScopedVal emptyScope expr
-                liftState $ esLoadedGlobals . at g .= Just result
+                case result of
+                    Left _ -> return ()
+                    Right r ->
+                        liftState $ esLoadedGlobals . at g .= Just r
                 return result
 
 initialState :: Env m pl -> EvalState m pl

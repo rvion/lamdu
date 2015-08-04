@@ -19,22 +19,23 @@ import qualified Graphics.UI.Bottle.Widgets.GridView as GridView
 import qualified Graphics.UI.Bottle.Widgets.Spacer as Spacer
 import qualified Lamdu.Config as Config
 import qualified Lamdu.Data.Anchors as Anchors
-import           Lamdu.Eval.Val (Val(..))
+import           Lamdu.Eval.Val (Val(..), EvalResult)
 import qualified Lamdu.Expr.Type as T
 import qualified Lamdu.Expr.Val as V
 import           Lamdu.GUI.ExpressionGui.Monad (ExprGuiM)
 import qualified Lamdu.GUI.ExpressionGui.Monad as ExprGuiM
 
-data RecordStatus = RecordComputed | RecordNotFinished
+data RecordStatus = RecordComputed | RecordExtendsError
 
 extractFields ::
-    V.RecExtend (Val ()) -> ([(T.Tag, Val ())], RecordStatus)
+    V.RecExtend (EvalResult ()) -> ([(T.Tag, EvalResult ())], RecordStatus)
 extractFields (V.RecExtend tag val rest) =
     case rest of
-    HRecEmpty -> ([(tag, val)], RecordComputed)
-    HRecExtend recExtend ->
+    Right HRecEmpty -> ([(tag, val)], RecordComputed)
+    Right (HRecExtend recExtend) ->
         extractFields recExtend & _1 %~ ((tag, val):)
-    _ -> error "RecExtend of non-record"
+    Right{} -> ([], RecordExtendsError) -- Should never happen
+    Left{} -> ([], RecordExtendsError)
 
 textView :: MonadA m => String -> AnimId -> ExprGuiM m View
 textView x animId = BWidgets.makeTextView x animId & ExprGuiM.widgetEnv
@@ -46,7 +47,7 @@ makeTag animId tag =
 
 makeField ::
     MonadA m =>
-    AnimId -> T.Tag -> Val () -> ExprGuiM m [(GridView.Alignment, View)]
+    AnimId -> T.Tag -> EvalResult () -> ExprGuiM m [(GridView.Alignment, View)]
 makeField parentAnimId tag val =
     do
         tagView <- makeTag (baseId ++ ["tag"]) tag
@@ -62,14 +63,19 @@ makeField parentAnimId tag val =
     where
         baseId = parentAnimId ++ [BinUtils.encodeS tag]
 
-make :: MonadA m => AnimId -> Val () -> ExprGuiM m View
-make animId val =
+make :: MonadA m => AnimId -> EvalResult () -> ExprGuiM m View
+make animId Left{} = textView "?" animId
+make animId (Right val) = makeForVal animId val
+
+makeForVal :: MonadA m => AnimId -> Val () -> ExprGuiM m View
+makeForVal animId val =
     case val of
     HFunc{} -> textView "Fn" animId
     HAbsurd -> textView "Fn" animId
     HCase{} -> textView "Fn" animId
     HRecEmpty -> textView "Ø" animId
-    HInject (V.Inject injTag HRecEmpty) -> makeTag (animId ++ ["tag"]) injTag
+    HInject (V.Inject injTag (Right HRecEmpty)) ->
+        makeTag (animId ++ ["tag"]) injTag
     HInject inj ->
         do
             tagView <- inj ^. V.injectTag & makeTag (animId ++ ["tag"])
@@ -87,7 +93,7 @@ make animId val =
             restView <-
                 case recStatus of
                 RecordComputed -> return View.empty
-                RecordNotFinished ->
+                RecordExtendsError ->
                     do
                         let sqr =
                                 View 1 (Anim.unitSquare (animId ++ ["line"]))

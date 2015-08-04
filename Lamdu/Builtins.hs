@@ -6,131 +6,137 @@ module Lamdu.Builtins
 import           Prelude.Compat
 
 import           Control.Lens.Operators
-import           Control.Monad (void)
+import           Control.Monad (join, void)
 import           Data.Map (Map)
 import qualified Data.Map as Map
 import           Data.Map.Utils (matchKeys)
 import qualified Lamdu.Builtins.Anchors as Builtins
 import qualified Lamdu.Data.Definition as Def
-import           Lamdu.Eval.Val (Val(..))
+import           Lamdu.Eval.Val (Val(..), EvalResult, EvalError(..))
 import           Lamdu.Expr.Type (Tag)
 import qualified Lamdu.Expr.Type as T
 import qualified Lamdu.Expr.Val as V
 
-flatRecord :: Val pl -> Map Tag (Val pl)
+flatRecord :: Val pl -> Map Tag (EvalResult pl)
 flatRecord HRecEmpty = Map.empty
-flatRecord (HRecExtend (V.RecExtend t v rest)) = flatRecord rest & Map.insert t v
+flatRecord (HRecExtend (V.RecExtend t v rest)) =
+    either (const Map.empty) flatRecord rest & Map.insert t v
 flatRecord _ = error "Param record is not a record"
 
 extractRecordParams ::
-    (Traversable t, Show (t Tag)) => t Tag -> Val pl -> t (Val pl)
+    (Traversable t, Show (t Tag)) =>
+    t Tag -> Val pl -> Either EvalError (t (Val pl))
 extractRecordParams expectedTags val =
     case matchKeys expectedTags paramsMap of
-    Nothing ->
-        error $ concat
-        [ "Param list mismatches expected params: "
-        , show expectedTags, " vs. ", show (Map.keys paramsMap)
-        ]
-    Just x -> x
+    Nothing -> Left EvalError
+    Just x -> sequenceA x
     where
         paramsMap = flatRecord val
 
 data V2 a = V2 a a   deriving (Show, Functor, Foldable, Traversable)
 data V3 a = V3 a a a deriving (Show, Functor, Foldable, Traversable)
 
-extractInfixParams :: Val pl -> V2 (Val pl)
-extractInfixParams = extractRecordParams (V2 Builtins.infixlTag Builtins.infixrTag)
+extractInfixParams :: Val pl -> Either EvalError (V2 (Val pl))
+extractInfixParams =
+        extractRecordParams (V2 Builtins.infixlTag Builtins.infixrTag)
 
 class GuestType t where
     toGuest :: t -> Val pl
-    fromGuest :: Val pl -> t
+    fromGuest :: Val pl -> Either EvalError t
 
 instance GuestType Integer where
     toGuest = HInteger
-    fromGuest (HInteger x) = x
+    fromGuest (HInteger x) = Right x
     fromGuest x = error $ "expected int, got " ++ show (void x)
 
 instance GuestType Bool where
     toGuest b =
-        record [] & V.Inject (tag b) & HInject
+        record [] & Right & V.Inject (tag b) & HInject
         where
             tag True = Builtins.trueTag
             tag False = Builtins.falseTag
     fromGuest v =
         case v of
         HInject (V.Inject boolTag _)
-            | boolTag == Builtins.trueTag -> True
-            | boolTag == Builtins.falseTag -> False
-        _ -> error $ "expected bool, got " ++ show (void v)
+            | boolTag == Builtins.trueTag -> Right True
+            | boolTag == Builtins.falseTag -> Right False
+        _ -> Left EvalError
 
 record :: [(T.Tag, Val pl)] -> Val pl
 record [] = HRecEmpty
-record ((tag, val) : xs) = record xs & V.RecExtend tag val & HRecExtend
+record ((tag, val) : xs) =
+    record xs & Right & V.RecExtend tag (Right val) & HRecExtend
 
 instance GuestType t => GuestType [t] where
-    toGuest [] = record [] & V.Inject "[]" & HInject
+    toGuest [] = record [] & Right & V.Inject "[]" & HInject
     toGuest (x:xs) =
         record
         [ ("head", toGuest x)
         , ("tail", toGuest xs)
-        ] & V.Inject "[]" & HInject
-    fromGuest (HInject (V.Inject t val))
-        | t == "[]" = []
+        ] & Right & V.Inject "[]" & HInject
+    fromGuest (HInject (V.Inject t v))
+        | t == "[]" = Right []
         | t == ":" =
-            case (Map.lookup "head" fields, Map.lookup "tail" fields) of
-            (Just hd, Just tl) -> fromGuest hd : fromGuest tl
-            _ -> error ": constructor without head/tail in it?!"
-        where
-            fields = flatRecord val
+            case v of
+            Left _ -> Left EvalError
+            Right val ->
+                case (Map.lookup "head" fields, Map.lookup "tail" fields) of
+                (Just (Right hd), Just (Right tl)) ->
+                    (:) <$> fromGuest hd <*> fromGuest tl
+                _ -> Left EvalError
+                where
+                    fields = flatRecord val
     fromGuest x = error $ "Expected list: got " ++ show (void x)
 
-builtin1 :: (GuestType a, GuestType b) => (a -> b) -> Val pl -> Val pl
-builtin1 f val = fromGuest val & f & toGuest
+builtin1 :: (GuestType a, GuestType b) => (a -> b) -> Val pl -> EvalResult pl
+builtin1 f val = fromGuest val <&> f <&> toGuest
 
 builtin2Infix ::
     ( GuestType a
     , GuestType b
     , GuestType c ) =>
-    (a -> b -> c) -> Val pl -> Val pl
+    (a -> b -> c) -> Val pl -> EvalResult pl
 builtin2Infix f thunkId =
-    f (fromGuest x) (fromGuest y) & toGuest
-    where
-        V2 x y = extractInfixParams thunkId
+    do
+        V2 x y <- extractInfixParams thunkId
+        f <$> fromGuest x <*> fromGuest y <&> toGuest
 
-eq :: Val t -> Val t -> Bool
-eq HFunc {} _ = error "Cannot compare functions"
-eq HAbsurd {} _ = error "Cannot compare case analysis"
-eq HCase {} _ = error "Cannot compare case analysis"
-eq HBuiltin {} _ = error "Cannot compare builtins"
-eq (HInteger x) (HInteger y) = x == y
-eq (HRecExtend x) (HRecExtend y) =
-    Map.keys fx == Map.keys fy &&
-    (Map.intersectionWith eq fx fy & Map.elems & and)
+eq :: Val t -> Val t -> Either EvalError Bool
+eq HFunc {} _    = Left EvalError
+eq HAbsurd {} _  = Left EvalError
+eq HCase {} _    = Left EvalError
+eq HBuiltin {} _ = Left EvalError
+eq (HInteger x) (HInteger y) = x == y & Right
+eq (HRecExtend x) (HRecExtend y)
+    | Map.keysSet fx /= Map.keysSet fy = Left EvalError
+    | otherwise =
+        Map.intersectionWith eq <$> sequenceA fx <*> sequenceA fy
+        <&> Map.elems <&> sequence & join <&> and
     where
-        fx = flatRecord $ HRecExtend x
-        fy = flatRecord $ HRecExtend y
-eq HRecEmpty HRecEmpty = True
+        fx = HRecExtend x & flatRecord
+        fy = HRecExtend y & flatRecord
+eq HRecEmpty HRecEmpty = Right True
 eq (HInject (V.Inject xf xv)) (HInject (V.Inject yf yv))
-    | xf == yf = eq xv yv
-    | otherwise = False
-eq _ _ = False -- assume type checking ruled out errorenous equalities already
+    | xf == yf = eq <$> xv <*> yv & join
+    | otherwise = Right False
+eq _ _ = Right False -- assume type checking ruled out errorenous equalities already
 
-builtinEqH :: GuestType t => (Bool -> t) -> Val pl -> Val pl
+builtinEqH :: GuestType t => (Bool -> t) -> Val pl -> EvalResult pl
 builtinEqH f val =
-    eq x y & f & toGuest
-    where
-        V2 x y = extractInfixParams val
+    do
+        V2 x y <- extractInfixParams val
+        eq x y <&> f <&> toGuest
 
-builtinEq :: Val pl -> Val pl
+builtinEq :: Val pl -> EvalResult pl
 builtinEq = builtinEqH id
 
-builtinNotEq :: Val pl -> Val pl
+builtinNotEq :: Val pl -> EvalResult pl
 builtinNotEq = builtinEqH not
 
 intArg :: (Integer -> a) -> Integer -> a
 intArg = id
 
-eval :: Def.FFIName -> Val pl -> Val pl
+eval :: Def.FFIName -> Val pl -> EvalResult pl
 eval name =
     case name of
     Def.FFIName ["Prelude"] "=="     -> builtinEq
